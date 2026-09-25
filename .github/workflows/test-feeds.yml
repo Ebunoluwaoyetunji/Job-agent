@@ -17,46 +17,30 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
 
-      - name: Compare the two MyJobMag feeds
+      - name: Is the HotNigerianJobs feed behind the website?
         run: |
           python - <<'PY'
-          import job_agent as ja
-          a = ja.fetch_rss("A", "https://www.myjobmag.com/feeds/ng/jobsxml.xml")
-          b = ja.fetch_rss("B", "https://www.myjobmag.com/feeds/ng/jobsxml_by_categories.xml")
-          ta, tb = {j["title"] for j in a}, {j["title"] for j in b}
-          print("titles only in A:", len(ta - tb), "only in B:", len(tb - ta), "in both:", len(ta & tb))
-          la, lb = {j["link"] for j in a}, {j["link"] for j in b}
-          print("links in both:", len(la & lb))
-          for x, y in list(zip(a, b))[:3]:
-              print(" A:", x["title"], x["link"], x["posted"])
-              print(" B:", y["title"], y["link"], y["posted"], y["location"])
+          import re, requests, feedparser, job_agent as ja
+          H = ja.BROWSER_HEADERS
+          f = feedparser.parse(requests.get("https://www.hotnigerianjobs.com/feed/rss.xml", headers=H, timeout=30).content)
+          feed_ids = [int(m) for e in f.entries for m in re.findall(r"/hotjobs/(\d+)/", e.link)]
+          print("feed: newest id", max(feed_ids), "oldest id", min(feed_ids))
+          print("feed: first 3 dates", [e.get("published") for e in f.entries[:3]])
+          print("feed: last 3 dates", [e.get("published") for e in f.entries[-3:]])
+          for url in ["https://www.hotnigerianjobs.com/", "https://www.hotnigerianjobs.com/jobs/"]:
+              try:
+                  r = requests.get(url, headers=H, timeout=30)
+                  ids = [int(x) for x in re.findall(r"/hotjobs/(\d+)/", r.text)]
+                  dates = re.findall(r"(\d{1,2}(?:st|nd|rd|th)? (?:Sep|September)[a-z]*,? 2026)", r.text)[:5]
+                  print(url, r.status_code, "newest id on site:", max(ids) if ids else None, "| dates seen:", dates)
+              except Exception as ex:
+                  print(url, "ERROR", ex)
+          for url in ["https://www.hotnigerianjobs.com/feed/rss.xml?nocache=1", "https://www.hotnigerianjobs.com/feed/"]:
+              try:
+                  r = requests.get(url, headers=H, timeout=30)
+                  f2 = feedparser.parse(r.content)
+                  ids2 = [int(m) for e in f2.entries for m in re.findall(r"/hotjobs/(\d+)/", e.link)]
+                  print(url, r.status_code, len(f2.entries), "newest id:", max(ids2) if ids2 else None)
+              except Exception as ex:
+                  print(url, "ERROR", ex)
           PY
-
-      - name: Look at HotNigerianJobs raw items
-        run: |
-          python - <<'PY'
-          import re, collections, requests, feedparser, job_agent as ja
-          r = requests.get("https://www.hotnigerianjobs.com/feed/rss.xml", headers=ja.BROWSER_HEADERS, timeout=30)
-          raw = r.text
-          print("Last-Modified:", r.headers.get("last-modified"), "| Date:", r.headers.get("date"), "| cache:", r.headers.get("cf-cache-status"), r.headers.get("age"))
-          items = re.findall(r"<item>.*?</item>", raw, re.S)
-          for it in items[:3]:
-              print(it[:700]); print("---")
-          f = feedparser.parse(r.content)
-          days = collections.Counter(e.get("published", "")[:16] for e in f.entries)
-          print("posts per day:", sorted(days.items(), reverse=True)[:8])
-          bad = 0
-          for e in f.entries:
-              slug = e.link.rsplit("/", 1)[-1].split(".")[0].replace("-", " ")
-              words = set(re.findall(r"[a-z]+", e.title.lower()))
-              first = slug.split()[:2]
-              if first and not all(w in words or len(w) < 3 for w in first):
-                  bad += 1
-                  if bad <= 5: print("MISMATCH:", e.title, "->", e.link)
-          print("title/link mismatches:", bad, "of", len(f.entries))
-          PY
-
-      - name: Try Jobzilla once more with plainer headers
-        run: |
-          curl -sS -o /dev/null -w "curl: %{http_code}\n" -A "Mozilla/5.0" https://www.jobzilla.ng/feed || true
-          curl -sS -o /dev/null -w "feed/rss2: %{http_code}\n" -A "Mozilla/5.0" "https://www.jobzilla.ng/feed/rss2" || true
