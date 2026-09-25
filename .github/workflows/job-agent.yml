@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "7,37 * * * *"
   workflow_dispatch:
+    inputs:
+      preview:
+        description: "Preview only: show today's top 15 jobs in the log. Sends and saves nothing."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -34,10 +39,10 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python job_agent.py
+        run: python job_agent.py ${{ inputs.preview && '--preview' || '' }}
 
       - name: Save seen jobs
+        if: ${{ !inputs.preview }}
         run: |
           if [ ! -f seen.json ]; then exit 0; fi
           git config user.name "github-actions[bot]"

@@ -2,10 +2,11 @@
 """
 Job alert agent.
 
-Checks job feeds, skips jobs it has already seen, asks Claude to score each
-new job against your profile, and sends the good ones to Telegram.
+Checks job feeds, skips jobs it has already seen, gives each new job a score
+with a simple points system, and sends the good ones to Telegram.
 
     python job_agent.py                 normal run
+    python job_agent.py --preview       score today's jobs and show the top 15, change nothing
     python job_agent.py --check-feeds   test every feed, change nothing
     python job_agent.py --dry-run       print Telegram messages instead of sending
 """
@@ -16,8 +17,9 @@ import json
 import os
 import re
 import sys
-import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 import feedparser
 import requests
@@ -26,6 +28,12 @@ import requests
 # =====================================================================
 # SETTINGS YOU CAN EDIT
 # =====================================================================
+#
+# All word lists ignore capital letters and match whole words only,
+# so "ey" does not match "money". Keywords also match their plurals
+# ("graduate trainee" also finds "Graduate Trainees").
+
+# ----- Where to look -----------------------------------------------
 
 # Job feeds to check: ("Name shown in Telegram", "Feed link")
 RSS_FEEDS = [
@@ -42,19 +50,10 @@ GREENHOUSE_BOARDS = [
     ("Moniepoint", "moniepoint"),
 ]
 
-# Only send jobs that Claude scores this high or higher (1 to 10)
-MIN_SCORE = 6
-
 # Ignore jobs posted longer ago than this many hours
 MAX_AGE_HOURS = 48
 
-# The Claude model that scores the jobs
-MODEL = "claude-haiku-4-5-20251001"
-
-# How many jobs to send to Claude in one go
-BATCH_SIZE = 30
-
-# Skip any job whose title contains one of these words
+# Skip any job whose title has one of these words. Skipped jobs are never scored.
 SKIP_WORDS = [
     "driver", "nanny", "housekeeper", "cleaner", "laundry", "cook", "chef",
     "security guard", "welder", "plumber", "electrician", "mechanic",
@@ -62,60 +61,87 @@ SKIP_WORDS = [
     "lecturer", "tutor", "caregiver", "director", "head of", "chief",
 ]
 
-# Backup plan: if Claude can't be reached, send jobs whose title
-# contains one of these words instead
-BACKUP_KEYWORDS = [
-    "product designer", "ux", "ui designer", "product design",
-    "graduate trainee", "management trainee", "graduate programme", "trainee",
-    "food scientist", "food technologist", "quality control",
-    "quality assurance", "production", "customer experience",
-    "business analyst", "analyst", "fmcg", "research", "product development",
+# ----- Scoring -----------------------------------------------------
+
+# Send jobs that score this much or more
+MIN_SCORE = 6
+
+# Keywords looked for in the job TITLE. The first list that matches gives the points.
+HIGH_KEYWORDS = [
+    "graduate trainee", "management trainee", "graduate programme", "graduate program",
+    "trainee programme", "graduate intern", "product designer", "ux designer",
+    "ui designer", "ui/ux", "ux/ui", "ux researcher", "product design",
+    "quality control", "quality assurance", "qc officer", "qa officer",
+    "food scientist", "food technologist", "research and development", "r&d",
+    "product development", "production officer", "production analyst",
+    "production supervisor",
 ]
+HIGH_POINTS = 8
 
-# Your profile. Claude reads this to score every job.
-PROFILE = """
-WHO I AM
-Ebun, 24, based in Lagos, Nigeria. NYSC completed March 2026.
-B.Tech Food Science and Technology, FUTA, CGPA 4.30/5.0 (First Class range).
-Student internship at a vegetable oil manufacturing company (production and quality exposure).
-About 2 years as a UI/UX and Product Designer: fintech (Nexapay), B2B SaaS (Cellcore), freelance.
-Taught students for 6 months during NYSC. VP of my CDS group.
+MEDIUM_KEYWORDS = [
+    "customer experience", "cx", "business analyst", "operations analyst",
+    "consulting analyst", "analyst", "investment", "client advisory", "advisory",
+    "product coordinator", "project coordinator", "research", "insights",
+    "customer success",
+]
+MEDIUM_POINTS = 6
 
-MY STRENGTHS
-Research and analysis, user empathy, problem solving, clear communication,
-Figma and design systems, working with product and engineering teams,
-science background with lab and quality control basics.
+# If the title has no keyword, the summary is checked instead, for this many points less
+SUMMARY_ONLY_PENALTY = 2
 
-WHAT I WANT
-A full-time job as soon as possible, at a corporate, structured company that pays well.
-Location: Lagos (on-site or hybrid) or fully remote.
-Experience level: graduate, entry level, or up to 3 years.
+# Bonus: a well-known company is named (in the title, location, summary or source)
+WELL_KNOWN_COMPANIES = [
+    "Zenith", "GTBank", "GTCO", "Access Bank", "First Bank", "FirstBank", "UBA",
+    "Stanbic", "Fidelity", "Wema", "Sterling", "FCMB", "Union Bank", "Ecobank",
+    "Standard Chartered", "Citibank", "KPMG", "PwC", "Deloitte", "EY",
+    "Ernst & Young", "Accenture", "McKinsey", "BCG", "Nestle", "Unilever",
+    "Nigerian Breweries", "Guinness", "Diageo", "Cadbury", "Dangote", "Flour Mills",
+    "FMN", "Olam", "PZ Cussons", "Seven Up", "Coca-Cola", "Nigerian Bottling",
+    "Friesland", "Promasidor", "Arla", "Tolaram", "MTN", "Airtel", "Glo", "9mobile",
+    "Shell", "Chevron", "TotalEnergies", "Seplat", "NNPC", "ExxonMobil",
+    "Moniepoint", "Flutterwave", "Paystack", "Interswitch", "Kuda", "OPay",
+    "PalmPay", "Andela", "Meristem", "Leadway", "AXA Mansard",
+]
+COMPANY_BONUS = 1
 
-SCORE HIGH (8 to 10)
-- Graduate trainee or management trainee programmes at banks, Big 4, consulting firms,
-  FMCGs, telecoms, oil and gas, or multinationals
-- Product Designer, UX Designer, UI/UX Designer, UX Researcher (junior to mid level)
-- FMCG roles: quality control, quality assurance, production, R&D, product development
+# Bonus: pay or benefits are mentioned
+BENEFIT_WORDS = ["salary", "hmo", "pension", "benefits"]
+BENEFITS_BONUS = 1
 
-SCORE MEDIUM (6 to 7)
-- Customer experience, business analyst, operations analyst, consulting analyst
-- Investment or client advisory trainee roles
-- Product or project coordinator roles at established companies
-- Research or insights roles
+# Bonus: Lagos or remote is mentioned
+GOOD_LOCATIONS = [
+    "lagos", "ikeja", "lekki", "victoria island", "remote", "anywhere in the world",
+]
+LOCATION_BONUS = 1
 
-SCORE LOW (1 to 5)
-- Small or unknown businesses with no clear structure
-- Roles asking for 4+ years of experience
-- Commission-only or field sales roles
-- Graphic design only roles (flyers, social media graphics)
-- Drivers, domestic staff, clinical roles, school teaching, artisan work
-- On-site roles outside Lagos
+# Penalty: a senior title. Titles with a NOT_SENIOR phrase are never penalised.
+SENIOR_WORDS = ["senior", "lead", "manager"]
+NOT_SENIOR = ["management trainee"]
+SENIOR_PENALTY = 3
 
-BONUS POINTS
-+1 if the company is a well-known name.
-+1 if it mentions salary, HMO, or good benefits.
-+1 if the deadline is soon.
-""".strip()
+# Penalty: asks for this many years of experience or more
+TOO_MANY_YEARS = 4
+EXPERIENCE_PENALTY = 3
+
+# Penalty: commission-based pay
+COMMISSION_WORDS = ["commission-based", "commission only"]
+COMMISSION_PENALTY = 3
+
+# Penalty: a graphic design title
+GRAPHIC_DESIGN_WORDS = ["graphic designer"]
+GRAPHIC_DESIGN_PENALTY = 3
+
+# Penalty: names a place outside Lagos, and doesn't mention a GOOD_LOCATION
+OTHER_STATES = [
+    "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa", "Benue",
+    "Borno", "Cross River", "Delta", "Ebonyi", "Edo", "Ekiti", "Enugu", "Gombe",
+    "Imo", "Jigawa", "Kaduna", "Kano", "Katsina", "Kebbi", "Kogi", "Kwara",
+    "Nasarawa", "Niger", "Ogun", "Ondo", "Osun", "Oyo", "Plateau", "Rivers",
+    "Sokoto", "Taraba", "Yobe", "Zamfara", "FCT", "Abuja", "Port Harcourt",
+    "Ibadan", "Benin City", "Warri", "Calabar", "Uyo", "Owerri", "Onitsha",
+    "Abeokuta", "Ilorin", "Jos", "Akure", "Asaba",
+]
+OTHER_STATE_PENALTY = 2
 
 # =====================================================================
 # END OF SETTINGS. You should not need to change anything below.
@@ -125,10 +151,10 @@ SEEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json"
 MAX_SEEN = 6000
 SUMMARY_LENGTH = 400
 TELEGRAM_LIMIT = 3800
+PREVIEW_COUNT = 15
 LIVE_MESSAGE = "Job agent is live. I'll message you when new jobs fit."
 
 GREENHOUSE_API = "https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true"
-ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 BROWSER_HEADERS = {
@@ -142,7 +168,6 @@ BROWSER_HEADERS = {
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
@@ -268,15 +293,15 @@ def fetch_all_sources():
     ]
     results = []
     for name, url, fetch, args in sources:
-        label = f"{name} [{url}]"
+        where = f"{name} [{url}]"
         try:
             jobs = fetch(*args)
-            log(f"  OK    {label}: {len(jobs)} jobs")
-            results.append((label, jobs, None))
+            log(f"  OK    {where}: {len(jobs)} jobs")
+            results.append((where, jobs, None))
         except Exception as error:
             reason = describe_error(error)
-            log(f"  FAIL  {label}: {reason}")
-            results.append((label, None, reason))
+            log(f"  FAIL  {where}: {reason}")
+            results.append((where, None, reason))
     return results
 
 
@@ -322,7 +347,7 @@ def fetch_all_jobs():
 # ---------------------------------------------------------------------
 
 def load_seen():
-    """Return the list of seen job IDs, or None if this is the first run."""
+    """Return the list of seen job keys, or None if this is the first run."""
     if not os.path.exists(SEEN_FILE):
         return None
     try:
@@ -336,21 +361,159 @@ def load_seen():
     return None
 
 
-def save_seen(ids):
+def save_seen(keys):
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(ids[-MAX_SEEN:], f, indent=0)
+        json.dump(keys[-MAX_SEEN:], f, indent=0)
         f.write("\n")
 
 
 # ---------------------------------------------------------------------
-# Filtering and scoring
+# Matching words
 # ---------------------------------------------------------------------
 
-def found_words(text, words):
-    """Words from the list that appear in the text (matching from the start of a word)."""
-    text = text.lower()
-    return [w for w in words if re.search(r"\b" + re.escape(w.lower()), text)]
+HYPHENS = set("-\u2010\u2011\u2012\u2013\u2014")  # all the kinds of dash
 
+
+def normalize(text):
+    """Lowercase, drop accents (Nestlé becomes nestle) and treat hyphens as spaces.
+
+    Keeps the same length as the input, so a match can be cut out of the
+    original text with its capitals intact.
+    """
+    chars = []
+    for ch in text:
+        base = unicodedata.normalize("NFKD", ch)[:1].lower()[:1]
+        chars.append(" " if base in HYPHENS else base)
+    return "".join(chars)
+
+
+@lru_cache(maxsize=None)
+def term_regex(term, plurals):
+    words = normalize(term).split()
+    body = r"\s+".join(re.escape(word) for word in words)
+    ending = "(?:s|es)?" if plurals else ""
+    return re.compile(rf"(?<![a-z0-9]){body}{ending}(?![a-z0-9])")
+
+
+def find_first(terms, text, plurals=True):
+    """The first term from the list found in the text, as written in the text. None if none."""
+    normalized = normalize(text)
+    for term in terms:
+        match = term_regex(term, plurals).search(normalized)
+        if match:
+            return re.sub(r"\s+", " ", text[match.start() : match.end()])
+    return None
+
+
+def label(found):
+    return found[:1].upper() + found[1:]
+
+
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_NUMBER = r"(\d{1,2}|" + "|".join(NUMBER_WORDS) + r")"
+_BRACKETED = r"(?:\s*\(\s*\d{1,2}\s*\))?"  # "five (5) years"
+YEARS_PATTERN = re.compile(
+    rf"(?<![a-z0-9]){_NUMBER}{_BRACKETED}\s*\+?\s*"
+    rf"(?:(?:to|and)?\s*\d{{1,2}}{_BRACKETED}\s*\+?\s*)?"  # a range like "3 - 5 years"
+    r"(?:years?|yrs?)(?![a-z])"
+)
+EXPERIENCE_HINTS = ("experience", "similar role", "similar position", "working")
+
+
+def years_asked(text):
+    """Years of experience the post asks for (the lower end of a range), or 0."""
+    normalized = normalize(text)
+    most = 0
+    for match in YEARS_PATTERN.finditer(normalized):
+        word = match.group(1)
+        years = int(word) if word.isdigit() else NUMBER_WORDS[word]
+        before = normalized[max(0, match.start() - 60) : match.start()]
+        after = normalized[match.end() : match.end() + 60]
+        if years > 15 or after.lstrip().startswith("old"):
+            continue  # an age limit or company history, not experience
+        if any(hint in before or hint in after for hint in EXPERIENCE_HINTS):
+            most = max(most, years)
+    return most
+
+
+# ---------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------
+
+def keyword_points(job):
+    """Points for the best keyword: title first, then the summary for fewer points."""
+    for text, minus, note in (
+        (job["title"], 0, ""),
+        (job["summary"], SUMMARY_ONLY_PENALTY, " (in summary)"),
+    ):
+        for keywords, points in ((HIGH_KEYWORDS, HIGH_POINTS), (MEDIUM_KEYWORDS, MEDIUM_POINTS)):
+            found = find_first(keywords, text)
+            if found:
+                return points - minus, label(found) + note
+    return 0, "No keyword match"
+
+
+def score_job(job):
+    """Return (score, reason) using the points in SETTINGS YOU CAN EDIT."""
+    title = job["title"]
+    everything = " | ".join([title, job["location"], job["summary"], job["source"]])
+
+    score, reason = keyword_points(job)
+    reasons = [reason]
+
+    if find_first(WELL_KNOWN_COMPANIES, everything, plurals=False):
+        score += COMPANY_BONUS
+        reasons.append("Well-known company")
+    if find_first(BENEFIT_WORDS, everything):
+        score += BENEFITS_BONUS
+        reasons.append("Salary/benefits")
+
+    place = find_first(GOOD_LOCATIONS, everything, plurals=False)
+    other_place = find_first(OTHER_STATES, everything, plurals=False)
+    if place:
+        score += LOCATION_BONUS
+        reasons.append(label(place))
+    elif other_place:
+        score -= OTHER_STATE_PENALTY
+        reasons.append(f"{label(other_place)} (-{OTHER_STATE_PENALTY})")
+
+    senior = find_first(SENIOR_WORDS, title)
+    if senior and not find_first(NOT_SENIOR, title):
+        score -= SENIOR_PENALTY
+        reasons.append(f"{label(senior)} (-{SENIOR_PENALTY})")
+
+    years = years_asked(everything)
+    if years >= TOO_MANY_YEARS:
+        score -= EXPERIENCE_PENALTY
+        reasons.append(f"{years}+ years experience (-{EXPERIENCE_PENALTY})")
+
+    if find_first(COMMISSION_WORDS, everything):
+        score -= COMMISSION_PENALTY
+        reasons.append(f"Commission (-{COMMISSION_PENALTY})")
+    if find_first(GRAPHIC_DESIGN_WORDS, title):
+        score -= GRAPHIC_DESIGN_PENALTY
+        reasons.append(f"Graphic design (-{GRAPHIC_DESIGN_PENALTY})")
+
+    return score, " · ".join(reasons)
+
+
+def score_all(jobs):
+    """Every job with its score and reason, best first."""
+    scored = []
+    for job in jobs:
+        score, reason = score_job(job)
+        scored.append({**job, "score": score, "why": reason})
+    oldest = datetime.min.replace(tzinfo=timezone.utc)
+    scored.sort(key=lambda j: (j["score"], j["posted"] or oldest), reverse=True)
+    return scored
+
+
+# ---------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------
 
 def is_recent(job, now):
     # A job with no date is new to us, so give it the benefit of the doubt
@@ -363,123 +526,11 @@ def format_date(value):
     return value.strftime("%Y-%m-%d %H:%M UTC") if value else "unknown"
 
 
-SYSTEM_PROMPT = f"""You score job posts for one job seeker, using their profile below.
-
-<profile>
-{PROFILE}
-</profile>
-
-For each job, give a score from 1 to 10 using the SCORE HIGH, SCORE MEDIUM and SCORE LOW
-rules and the BONUS POINTS in the profile. The score can never go above 10.
-If a post is vague, judge it from the title, company and location.
-
-Reply with ONLY a JSON array and nothing else, in exactly this form:
-[{{"i": 0, "score": 8, "why": "one short plain sentence"}}]
-
-Include every job exactly once. "i" is the job's number in brackets.
-"why" is one short, plain sentence on why the job does or does not fit."""
-
-
-def parse_scores(text, count):
-    """Turn Claude's reply into {job number: (score, why)}."""
-    text = text.strip()
-    text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1:
-        raise ValueError("Claude's reply had no JSON array")
-    scores = {}
-    for item in json.loads(text[start : end + 1]):
-        try:
-            number = int(item["i"])
-            score = int(round(float(item["score"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if 0 <= number < count:
-            scores[number] = (max(1, min(10, score)), str(item.get("why") or "").strip())
-    return scores
-
-
-def ask_claude(batch):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    listing = "\n\n".join(
-        f"[{i}] {job['title']}\n"
-        f"Source: {job['source']}\n"
-        f"Location: {job['location'] or 'not stated'}\n"
-        f"Posted: {format_date(job['posted'])}\n"
-        f"Summary: {job['summary'] or 'none'}"
-        for i, job in enumerate(batch)
-    )
-    body = {
-        "model": MODEL,
-        "max_tokens": 4000,
-        "temperature": 0,
-        "system": SYSTEM_PROMPT,
-        "messages": [{
-            "role": "user",
-            "content": f"Today is {today}. Score these {len(batch)} jobs.\n\n{listing}",
-        }],
-    }
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-
-    # Try up to 3 times if the API is busy or the network hiccups
-    for attempt in range(3):
-        if attempt:
-            time.sleep(5 * attempt)
-        try:
-            response = requests.post(ANTHROPIC_API, headers=headers, json=body, timeout=120)
-        except requests.RequestException as error:
-            problem = f"network error ({type(error).__name__})"
-            continue
-        if response.status_code == 200:
-            reply = response.json()
-            text = "".join(
-                block.get("text", "") for block in reply.get("content", []) if block.get("type") == "text"
-            )
-            return parse_scores(text, len(batch))
-        problem = f"HTTP {response.status_code}: {response.text[:300]}"
-        if response.status_code not in (408, 429, 500, 502, 503, 504, 529):
-            break
-    raise RuntimeError(problem)
-
-
-def keyword_matches(batch):
-    matches = []
-    for job in batch:
-        words = found_words(job["title"], BACKUP_KEYWORDS)
-        if words:
-            matches.append({**job, "score": None, "why": "Matched keyword: " + ", ".join(words[:3])})
-    return matches
-
-
-def score_jobs(jobs):
-    """Return the jobs worth sending, each with a score and a reason."""
-    if not ANTHROPIC_API_KEY:
-        log("ANTHROPIC_API_KEY is not set, so using backup keywords instead of Claude.")
-    matches = []
-    for start in range(0, len(jobs), BATCH_SIZE):
-        batch = jobs[start : start + BATCH_SIZE]
-        if ANTHROPIC_API_KEY:
-            try:
-                scores = ask_claude(batch)
-            except Exception as error:
-                log(f"Claude scoring failed ({error}). Using backup keywords for these {len(batch)} jobs.")
-            else:
-                log(f"Claude scored {len(scores)} of {len(batch)} jobs:")
-                for i, job in enumerate(batch):
-                    score, why = scores.get(i, (0, ""))
-                    log(f"  {score:>2}/10  {job['title']}  ({job['source']})")
-                    if score >= MIN_SCORE:
-                        matches.append({**job, "score": score, "why": why})
-                continue
-        matches.extend(keyword_matches(batch))
-    # Highest score first. Keyword matches (no score) go last.
-    matches.sort(key=lambda m: (m["score"] is not None, m["score"] or 0), reverse=True)
-    return matches
+def recent_and_relevant(jobs):
+    now = datetime.now(timezone.utc)
+    recent = [job for job in jobs if is_recent(job, now)]
+    relevant = [job for job in recent if not find_first(SKIP_WORDS, job["title"])]
+    return recent, relevant
 
 
 # ---------------------------------------------------------------------
@@ -521,12 +572,11 @@ def send_telegram(text, dry_run):
 
 
 def format_job(match):
-    score = f"{match['score']}/10" if match["score"] is not None else "Keyword match"
     title = html.escape(match["title"][:200], quote=False)
     source = html.escape(match["source"], quote=False)
-    why = html.escape((match["why"] or "No reason given.")[:300], quote=False)
+    why = html.escape(match["why"][:300], quote=False)
     link = html.escape(match["link"], quote=True)
-    return f'<b>{title}</b>\n{score} · {source}\n<i>{why}</i>\n<a href="{link}">Open job</a>'
+    return f'<b>{title}</b>\nScore {match["score"]} · {source}\n<i>{why}</i>\n<a href="{link}">Open job</a>'
 
 
 def build_messages(matches):
@@ -554,16 +604,34 @@ def check_feeds():
     results = fetch_all_sources()
     now = datetime.now(timezone.utc)
     log("")
-    for label, jobs, error in results:
+    for where, jobs, error in results:
         if jobs is None:
-            log(f"DEAD     {label}\n         {error}")
+            log(f"DEAD     {where}\n         {error}")
             continue
         dates = [job["posted"] for job in jobs if job["posted"]]
         recent = sum(1 for job in jobs if is_recent(job, now))
         newest = format_date(max(dates)) if dates else "no dates in feed"
-        log(f"WORKING  {label}\n         {len(jobs)} jobs, {recent} from the last {MAX_AGE_HOURS} hours, newest: {newest}")
+        log(f"WORKING  {where}\n         {len(jobs)} jobs, {recent} from the last {MAX_AGE_HOURS} hours, newest: {newest}")
         for job in jobs[:3]:
             log(f"         e.g. {job['title']}  |  {job['location'] or 'no location'}")
+
+
+def preview():
+    """Score the current jobs and show the best ones. Nothing is saved or sent."""
+    log("Preview: scoring the current jobs. Nothing is saved or sent.")
+    recent, relevant = recent_and_relevant(fetch_all_jobs())
+    scored = score_all(relevant)
+    passing = sum(1 for job in scored if job["score"] >= MIN_SCORE)
+    log(
+        f"\n{len(recent)} jobs from the last {MAX_AGE_HOURS} hours. "
+        f"{len(recent) - len(relevant)} skipped as misfits. "
+        f"{passing} of the other {len(relevant)} score {MIN_SCORE} or more.\n"
+    )
+    log(f"Top {min(PREVIEW_COUNT, len(scored))}:")
+    for rank, job in enumerate(scored[:PREVIEW_COUNT], 1):
+        log(f"{rank:>2}. Score {job['score']:>2}  {job['title']}")
+        log(f"              {job['why']}")
+        log(f"              {job['source']}  |  {job['link']}")
 
 
 def first_run(jobs, dry_run):
@@ -579,17 +647,19 @@ def first_run(jobs, dry_run):
 def normal_run(jobs, seen, dry_run):
     seen_keys = set(seen)
     new_jobs = [job for job in jobs if not any(key in seen_keys for key in job["keys"])]
-    now = datetime.now(timezone.utc)
-    recent = [job for job in new_jobs if is_recent(job, now)]
-    to_score = [job for job in recent if not found_words(job["title"], SKIP_WORDS)]
+    recent, relevant = recent_and_relevant(new_jobs)
     log(
         f"{len(new_jobs)} new jobs. {len(recent)} posted in the last {MAX_AGE_HOURS} hours. "
-        f"{len(to_score)} left after skipping misfit titles."
+        f"{len(relevant)} left after skipping misfit titles."
     )
 
-    matches = score_jobs(to_score) if to_score else []
+    scored = score_all(relevant)
+    for job in scored:
+        log(f"  {job['score']:>3}  {job['title']}  ({job['why']})")
+    matches = [job for job in scored if job["score"] >= MIN_SCORE]
+
     if matches:
-        log(f"{len(matches)} jobs fit. Sending to Telegram.")
+        log(f"{len(matches)} jobs score {MIN_SCORE} or more. Sending to Telegram.")
         for message in build_messages(matches):
             if not send_telegram(message, dry_run):
                 log("Could not send to Telegram. Not saving, so these jobs are tried again next run.")
@@ -604,6 +674,9 @@ def normal_run(jobs, seen, dry_run):
 def main():
     if "--check-feeds" in sys.argv:
         check_feeds()
+        return
+    if "--preview" in sys.argv:
+        preview()
         return
 
     dry_run = "--dry-run" in sys.argv or not telegram_ready()
