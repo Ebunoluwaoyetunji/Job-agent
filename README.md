@@ -24,11 +24,15 @@ Everything is free: GitHub runs it for free on public repos, and Telegram bots a
 | A well-known company is named | +1 |
 | Mentions salary, HMO, pension or benefits | +1 |
 | Mentions Lagos or remote | +1 |
-| Title has senior, lead or manager (not "management trainee") | -3 |
+| Title has senior or lead | -3 |
+| Title has manager (or the typo "manger"), except "management trainee" | -5 |
 | Asks for 4 or more years of experience | -3 |
 | Commission-based or commission only | -3 |
 | Title is graphic designer | -3 |
 | Names another Nigerian state, and not Lagos or remote | -2 |
+
+For titles like "Financial Analyst at Landgate Investments", only the role part
+("Financial Analyst") is checked for title keywords and title penalties, never the company name.
 
 Each Telegram alert shows the score and why, for example:
 *Graduate Trainee · Well-known company · Lagos*
@@ -69,7 +73,7 @@ Everything you might want to change is at the top of `job_agent.py`, under
 | Get more matches | Lower `MIN_SCORE` (for example to `5`) |
 | Look for a new kind of role | Add it to `HIGH_KEYWORDS` or `MEDIUM_KEYWORDS` |
 | Add a company I like | Add it to `WELL_KNOWN_COMPANIES` |
-| Change how much a rule counts | Change its number, like `HIGH_POINTS` or `SENIOR_PENALTY` |
+| Change how much a rule counts | Change its number, like `HIGH_POINTS` or `MANAGER_PENALTY` |
 | Stop seeing a type of job | Add a word to `SKIP_WORDS` |
 | Add a job site | Add a line to `RSS_FEEDS`: `("Site name", "feed link"),` |
 | Add a company on Greenhouse | Add a line to `GREENHOUSE_BOARDS`: `("Company", "board-name"),` |

@@ -32,6 +32,9 @@ import requests
 # All word lists ignore capital letters and match whole words only,
 # so "ey" does not match "money". Keywords also match their plurals
 # ("graduate trainee" also finds "Graduate Trainees").
+#
+# Anything checked in the TITLE only looks at the role, not the company:
+# in "Financial Analyst at Landgate Investments" that is "Financial Analyst".
 
 # ----- Where to look -----------------------------------------------
 
@@ -80,9 +83,10 @@ HIGH_POINTS = 8
 
 MEDIUM_KEYWORDS = [
     "customer experience", "cx", "business analyst", "operations analyst",
-    "consulting analyst", "analyst", "investment", "client advisory", "advisory",
-    "product coordinator", "project coordinator", "research", "insights",
-    "customer success",
+    "consulting analyst", "investment banking analyst", "investment analyst",
+    "investment trainee", "investment associate", "analyst", "client advisory",
+    "advisory", "product coordinator", "project coordinator", "research",
+    "insights", "customer success",
 ]
 MEDIUM_POINTS = 6
 
@@ -114,10 +118,16 @@ GOOD_LOCATIONS = [
 ]
 LOCATION_BONUS = 1
 
-# Penalty: a senior title. Titles with a NOT_SENIOR phrase are never penalised.
-SENIOR_WORDS = ["senior", "lead", "manager"]
-NOT_SENIOR = ["management trainee"]
+# Penalty: a senior title
+SENIOR_WORDS = ["senior", "lead"]
 SENIOR_PENALTY = 3
+
+# Penalty: a manager title ("manger" is a common typo in job posts)
+MANAGER_WORDS = ["manager", "manger"]
+MANAGER_PENALTY = 5
+
+# Titles with one of these never get the senior or manager penalty
+NOT_SENIOR = ["management trainee"]
 
 # Penalty: asks for this many years of experience or more
 TOO_MANY_YEARS = 4
@@ -443,10 +453,20 @@ def years_asked(text):
 # Scoring
 # ---------------------------------------------------------------------
 
+def role_part(title):
+    """The role in a "Role at Company" title: everything before the last " at "."""
+    splits = list(re.finditer(r"\s+at\s+", title, flags=re.I))
+    if splits:
+        role = title[: splits[-1].start()].strip()
+        if role:
+            return role
+    return title
+
+
 def keyword_points(job):
     """Points for the best keyword: title first, then the summary for fewer points."""
     for text, minus, note in (
-        (job["title"], 0, ""),
+        (role_part(job["title"]), 0, ""),
         (job["summary"], SUMMARY_ONLY_PENALTY, " (in summary)"),
     ):
         for keywords, points in ((HIGH_KEYWORDS, HIGH_POINTS), (MEDIUM_KEYWORDS, MEDIUM_POINTS)):
@@ -480,10 +500,16 @@ def score_job(job):
         score -= OTHER_STATE_PENALTY
         reasons.append(f"{label(other_place)} (-{OTHER_STATE_PENALTY})")
 
-    senior = find_first(SENIOR_WORDS, title)
-    if senior and not find_first(NOT_SENIOR, title):
-        score -= SENIOR_PENALTY
-        reasons.append(f"{label(senior)} (-{SENIOR_PENALTY})")
+    role = role_part(title)
+    if not find_first(NOT_SENIOR, role):
+        senior = find_first(SENIOR_WORDS, role)
+        if senior:
+            score -= SENIOR_PENALTY
+            reasons.append(f"{label(senior)} (-{SENIOR_PENALTY})")
+        manager = find_first(MANAGER_WORDS, role)
+        if manager:
+            score -= MANAGER_PENALTY
+            reasons.append(f"{label(manager)} (-{MANAGER_PENALTY})")
 
     years = years_asked(everything)
     if years >= TOO_MANY_YEARS:
@@ -493,7 +519,7 @@ def score_job(job):
     if find_first(COMMISSION_WORDS, everything):
         score -= COMMISSION_PENALTY
         reasons.append(f"Commission (-{COMMISSION_PENALTY})")
-    if find_first(GRAPHIC_DESIGN_WORDS, title):
+    if find_first(GRAPHIC_DESIGN_WORDS, role):
         score -= GRAPHIC_DESIGN_PENALTY
         reasons.append(f"Graphic design (-{GRAPHIC_DESIGN_PENALTY})")
 
@@ -529,7 +555,7 @@ def format_date(value):
 def recent_and_relevant(jobs):
     now = datetime.now(timezone.utc)
     recent = [job for job in jobs if is_recent(job, now)]
-    relevant = [job for job in recent if not find_first(SKIP_WORDS, job["title"])]
+    relevant = [job for job in recent if not find_first(SKIP_WORDS, role_part(job["title"]))]
     return recent, relevant
 
 
@@ -627,11 +653,13 @@ def preview():
         f"{len(recent) - len(relevant)} skipped as misfits. "
         f"{passing} of the other {len(relevant)} score {MIN_SCORE} or more.\n"
     )
-    log(f"Top {min(PREVIEW_COUNT, len(scored))}:")
-    for rank, job in enumerate(scored[:PREVIEW_COUNT], 1):
-        log(f"{rank:>2}. Score {job['score']:>2}  {job['title']}")
-        log(f"              {job['why']}")
-        log(f"              {job['source']}  |  {job['link']}")
+    shown = scored[: max(PREVIEW_COUNT, passing)]
+    log(f"Top {len(shown)} (SEND means it would be sent):")
+    for rank, job in enumerate(shown, 1):
+        send = "SEND" if job["score"] >= MIN_SCORE else "    "
+        log(f"{rank:>2}. {send}  Score {job['score']:>2}  {job['title']}")
+        log(f"                    {job['why']}")
+        log(f"                    {job['source']}  |  {job['link']}")
 
 
 def first_run(jobs, dry_run):
