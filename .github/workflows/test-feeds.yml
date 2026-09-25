@@ -17,35 +17,46 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
 
-      - name: Check every feed
-        run: python job_agent.py --check-feeds
-
-      - name: Show fields each feed provides
+      - name: Compare the two MyJobMag feeds
         run: |
           python - <<'PY'
-          import feedparser, requests, job_agent as ja
-          for name, url in ja.RSS_FEEDS:
-              try:
-                  r = requests.get(url, headers=ja.BROWSER_HEADERS, timeout=30)
-                  f = feedparser.parse(r.content)
-                  print(name, url, r.status_code, r.headers.get("content-type"), "entries:", len(f.entries))
-                  if f.entries:
-                      e = f.entries[0]
-                      print("   keys:", sorted(k for k in e.keys() if not k.endswith("_detail")))
-                      print("   tags:", [t.get("term") for t in e.get("tags", [])][:8])
-                  else:
-                      print("   body:", r.text[:400].replace("\n", " "))
-              except Exception as ex:
-                  print(name, "ERROR", type(ex).__name__, ex)
+          import job_agent as ja
+          a = ja.fetch_rss("A", "https://www.myjobmag.com/feeds/ng/jobsxml.xml")
+          b = ja.fetch_rss("B", "https://www.myjobmag.com/feeds/ng/jobsxml_by_categories.xml")
+          ta, tb = {j["title"] for j in a}, {j["title"] for j in b}
+          print("titles only in A:", len(ta - tb), "only in B:", len(tb - ta), "in both:", len(ta & tb))
+          la, lb = {j["link"] for j in a}, {j["link"] for j in b}
+          print("links in both:", len(la & lb))
+          for x, y in list(zip(a, b))[:3]:
+              print(" A:", x["title"], x["link"], x["posted"])
+              print(" B:", y["title"], y["link"], y["posted"], y["location"])
           PY
 
-      - name: Run 1 (first run, no secrets)
-        run: python job_agent.py --dry-run && echo "--- seen.json has $(python -c 'import json;print(len(json.load(open("seen.json"))))') IDs"
-
-      - name: Run 2 (same jobs again, nothing new expected)
-        run: python job_agent.py --dry-run
-
-      - name: Run 3 (forget every 3rd job to test the new-jobs path)
+      - name: Look at HotNigerianJobs raw items
         run: |
-          python -c "import json; ids=json.load(open('seen.json')); json.dump([x for i,x in enumerate(ids) if i%3], open('seen.json','w'))"
-          python job_agent.py --dry-run
+          python - <<'PY'
+          import re, collections, requests, feedparser, job_agent as ja
+          r = requests.get("https://www.hotnigerianjobs.com/feed/rss.xml", headers=ja.BROWSER_HEADERS, timeout=30)
+          raw = r.text
+          print("Last-Modified:", r.headers.get("last-modified"), "| Date:", r.headers.get("date"), "| cache:", r.headers.get("cf-cache-status"), r.headers.get("age"))
+          items = re.findall(r"<item>.*?</item>", raw, re.S)
+          for it in items[:3]:
+              print(it[:700]); print("---")
+          f = feedparser.parse(r.content)
+          days = collections.Counter(e.get("published", "")[:16] for e in f.entries)
+          print("posts per day:", sorted(days.items(), reverse=True)[:8])
+          bad = 0
+          for e in f.entries:
+              slug = e.link.rsplit("/", 1)[-1].split(".")[0].replace("-", " ")
+              words = set(re.findall(r"[a-z]+", e.title.lower()))
+              first = slug.split()[:2]
+              if first and not all(w in words or len(w) < 3 for w in first):
+                  bad += 1
+                  if bad <= 5: print("MISMATCH:", e.title, "->", e.link)
+          print("title/link mismatches:", bad, "of", len(f.entries))
+          PY
+
+      - name: Try Jobzilla once more with plainer headers
+        run: |
+          curl -sS -o /dev/null -w "curl: %{http_code}\n" -A "Mozilla/5.0" https://www.jobzilla.ng/feed || true
+          curl -sS -o /dev/null -w "feed/rss2: %{http_code}\n" -A "Mozilla/5.0" "https://www.jobzilla.ng/feed/rss2" || true
