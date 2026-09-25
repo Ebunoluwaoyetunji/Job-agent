@@ -1,0 +1,51 @@
+name: Test feeds (temporary)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+
+      - name: Check every feed
+        run: python job_agent.py --check-feeds
+
+      - name: Show fields each feed provides
+        run: |
+          python - <<'PY'
+          import feedparser, requests, job_agent as ja
+          for name, url in ja.RSS_FEEDS:
+              try:
+                  r = requests.get(url, headers=ja.BROWSER_HEADERS, timeout=30)
+                  f = feedparser.parse(r.content)
+                  print(name, url, r.status_code, r.headers.get("content-type"), "entries:", len(f.entries))
+                  if f.entries:
+                      e = f.entries[0]
+                      print("   keys:", sorted(k for k in e.keys() if not k.endswith("_detail")))
+                      print("   tags:", [t.get("term") for t in e.get("tags", [])][:8])
+                  else:
+                      print("   body:", r.text[:400].replace("\n", " "))
+              except Exception as ex:
+                  print(name, "ERROR", type(ex).__name__, ex)
+          PY
+
+      - name: Run 1 (first run, no secrets)
+        run: python job_agent.py --dry-run && echo "--- seen.json has $(python -c 'import json;print(len(json.load(open("seen.json"))))') IDs"
+
+      - name: Run 2 (same jobs again, nothing new expected)
+        run: python job_agent.py --dry-run
+
+      - name: Run 3 (forget every 3rd job to test the new-jobs path)
+        run: |
+          python -c "import json; ids=json.load(open('seen.json')); json.dump([x for i,x in enumerate(ids) if i%3], open('seen.json','w'))"
+          python job_agent.py --dry-run
