@@ -32,9 +32,9 @@ RSS_FEEDS = [
     ("MyJobMag", "https://www.myjobmag.com/feeds/ng/jobsxml.xml"),
     ("MyJobMag", "https://www.myjobmag.com/feeds/ng/jobsxml_by_categories.xml"),
     ("HotNigerianJobs", "https://www.hotnigerianjobs.com/feed/rss.xml"),
-    ("Jobzilla", "https://www.jobzilla.ng/feed"),
     ("We Work Remotely", "https://weworkremotely.com/remote-jobs.rss"),
 ]
+# Removed on 25 Sep 2026: Jobzilla (https://www.jobzilla.ng/feed) blocks GitHub's servers.
 
 # Company career pages hosted on Greenhouse: ("Company name", "board name").
 # The board name is the last part of the link, e.g. boards.greenhouse.io/moniepoint
@@ -280,12 +280,31 @@ def fetch_all_sources():
     return results
 
 
+def job_keys(job):
+    """How a job is recognised: its link, and its title on that site.
+
+    The title key matters because MyJobMag lists some jobs in both of its
+    feeds under two different links.
+    """
+    title = re.sub(r"\s+", " ", job["title"].lower())
+    return [job["id"], f"{job['source']}|{title}"]
+
+
 def remove_duplicates(jobs):
-    ids, unique = set(), []
+    """Keep one copy of each job. The copy we keep remembers every key."""
+    kept_by_key, unique = {}, []
     for job in jobs:
-        if job["id"] not in ids:
-            ids.add(job["id"])
-            unique.append(job)
+        keys = job_keys(job)
+        kept = next((kept_by_key[k] for k in keys if k in kept_by_key), None)
+        if kept is None:
+            kept = job
+            kept["keys"] = keys
+            unique.append(kept)
+        else:
+            kept["keys"] += [k for k in keys if k not in kept["keys"]]
+            kept["location"] = kept["location"] or job["location"]
+        for k in keys:
+            kept_by_key[k] = kept
     return unique
 
 
@@ -551,15 +570,15 @@ def first_run(jobs, dry_run):
     if not jobs:
         log("First run, but no jobs could be fetched from any source. Saving nothing. Will try again next run.")
         sys.exit(1)
-    save_seen([job["id"] for job in jobs])
+    save_seen([key for job in jobs for key in job["keys"]])
     log(f"First run: saved {len(jobs)} current jobs as seen, so you don't get flooded with old posts.")
     if not send_telegram(LIVE_MESSAGE, dry_run):
         sys.exit(1)
 
 
 def normal_run(jobs, seen, dry_run):
-    seen_ids = set(seen)
-    new_jobs = [job for job in jobs if job["id"] not in seen_ids]
+    seen_keys = set(seen)
+    new_jobs = [job for job in jobs if not any(key in seen_keys for key in job["keys"])]
     now = datetime.now(timezone.utc)
     recent = [job for job in new_jobs if is_recent(job, now)]
     to_score = [job for job in recent if not found_words(job["title"], SKIP_WORDS)]
@@ -578,8 +597,8 @@ def normal_run(jobs, seen, dry_run):
     else:
         log("No new jobs fit this time.")
 
-    save_seen(seen + [job["id"] for job in new_jobs])
-    log(f"Saved {len(new_jobs)} new job IDs to seen.json.")
+    save_seen(seen + [key for job in new_jobs for key in job["keys"]])
+    log(f"Saved {len(new_jobs)} new jobs to seen.json.")
 
 
 def main():

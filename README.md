@@ -2,7 +2,7 @@
 
 A personal job alert bot. Every 30 minutes, GitHub runs `job_agent.py`, which:
 
-1. Checks job feeds (MyJobMag, HotNigerianJobs, Jobzilla, We Work Remotely, Moniepoint careers).
+1. Checks job feeds (MyJobMag, HotNigerianJobs, We Work Remotely, Moniepoint careers).
 2. Skips jobs it has already seen (they are listed in `seen.json`).
 3. Skips old posts and obvious misfits (driver, chef, nurse and so on).
 4. Asks Claude to score each new job from 1 to 10 against your profile.
